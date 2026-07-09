@@ -3,100 +3,164 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>カメラ ＆ GAS送信テスト</title>
+    <title>QR/バーコードスキャナー ＆ GAS</title>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    
     <style>
         body { font-family: -apple-system, sans-serif; text-align: center; background: #f5f5f7; padding: 20px; margin: 0; }
+        h1 { font-size: 1.4rem; color: #333; margin-bottom: 20px; }
         button { padding: 12px 24px; font-size: 1rem; font-weight: bold; border: none; border-radius: 8px; background: #0071e3; color: white; cursor: pointer; margin: 5px; }
         button:active { background: #005bb5; }
-        #video-container { position: relative; max-width: 500px; margin: 20px auto; border-radius: 12px; overflow: hidden; background: #000; }
-        video { width: 100%; display: block; }
-        .scan-frame { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 60%; height: 60%; border: 3px dashed #00ff00; opacity: 0.5; pointer-events: none; }
-        #status { font-weight: bold; color: #86868b; }
-        .test-input-area { margin-top: 20px; padding: 15px; background: #fff; border-radius: 8px; max-width: 500px; margin-left: auto; margin-right: auto; }
-        input { padding: 10px; width: 60%; font-size: 1rem; border: 1px solid #ccc; border-radius: 4px; }
+        button:disabled { background: #aeaeae; cursor: not-allowed; }
+        
+        /* スキャン画面のコンテナ */
+        #reader-wrapper {
+            max-width: 500px;
+            margin: 0 auto;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            background: #000;
+        }
+        /* ライブラリが描画するビデオ画面のスタイル */
+        #reader {
+            width: 100%;
+        }
+        
+        #status { font-weight: bold; margin-top: 15px; color: #86868b; padding: 0 10px; }
+        
+        /* 履歴表示エリア */
+        .history-area { margin-top: 25px; padding: 15px; background: #fff; border-radius: 8px; max-width: 500px; margin-left: auto; margin-right: auto; text-align: left; }
+        .history-area h3 { margin-top: 0; font-size: 1.1rem; border-bottom: 2px solid #f5f5f7; padding-bottom: 5px; }
+        ul { padding-left: 20px; margin: 0; font-size: 0.9rem; color: #333; }
+        li { margin-bottom: 5px; }
     </style>
 </head>
 <body>
 
-    <h1>カメラ ＆ GAS送信テスト</h1>
+    <h1>QR / バーコードスキャナー</h1>
     
     <div>
-        <button id="btn-start">カメラを起動</button>
+        <button id="btn-toggle">スキャン開始</button>
     </div>
 
-    <div id="video-container">
-        <video id="video" autoplay playsinline muted></video>
-        <div class="scan-frame"></div>
+    <div id="reader-wrapper">
+        <div id="reader"></div>
     </div>
 
     <p id="status">カメラ未起動</p>
 
-    <div class="test-input-area">
-        <h3>GAS送信テスト</h3>
-        <p style="font-size:0.85rem; color:#666;">（QRコードが読み取れたと仮定して、文字をスプレッドシートに送るテスト）</p>
-        <input type="text" id="test-data" value="テストデータ123">
-        <button id="btn-send">GASへ送信</button>
+    <div class="history-area">
+        <h3>読み取り履歴 (スプレッドシート送信済み)</h3>
+        <ul id="history-list">
+            </ul>
     </div>
 
     <script>
-        // ★ここに先ほどコピーしたGASの「ウェブアプリのURL」を貼り付けてください
-        const GAS_URL = "https://script.google.com/macros/s/AKfycbzGOXdtaZrikNEyAkjpUIA6YS4--8KpazyP_KSyGvcd3uNv5DyXh3RS9rk1n22qMtZP/exec";
+        // ★確認が取れたGASの「ウェブアプリのURL」をここに貼り付けてください
+        const GAS_URL = "https://script.google.com/macros/s/XXXXX/exec";
 
-        const video = document.getElementById('video');
-        const btnStart = document.getElementById('btn-start');
-        const btnSend = document.getElementById('btn-send');
+        const btnToggle = document.getElementById('btn-toggle');
         const statusText = document.getElementById('status');
-        const testDataInput = document.getElementById('test-data');
+        const historyList = document.getElementById('history-list');
 
-        // 1. カメラ起動処理（GitHub Pages上なら100%動きます）
-        btnStart.addEventListener('click', async () => {
-            const constraints = {
-                video: { facingMode: { ideal: "environment" } },
-                audio: false
-            };
-            try {
-                statusText.innerText = "カメラ起動中...";
-                const stream = await navigator.mediaDevices.getUserMedia(constraints);
-                video.srcObject = stream;
-                statusText.innerText = "カメラ起動成功！";
-                statusText.style.color = "#34c759";
-            } catch (err) {
-                statusText.innerText = "カメラエラー: " + err.name;
-                statusText.style.color = "#ff3b30";
-                console.error(err);
+        let html5QrcodeScanner = null;
+        let isScanning = false;
+        let lastScannedCode = ""; // 連続読み取り防止用のメモリ
+        let lastScannedTime = 0;
+
+        // ② QR/バーコードが正常に読み取れた時の処理
+        async function onScanSuccess(decodedText, decodedResult) {
+            const now = Date.now();
+            // 同じコードを3秒以内に連続で読み取らないように制御（チャタリング防止）
+            if (decodedText === lastScannedCode && (now - lastScannedTime) < 3000) {
+                return; 
             }
-        });
+            
+            lastScannedCode = decodedText;
+            lastScannedTime = now;
 
-        // 2. GAS（API）へのデータ送信処理
-        btnSend.addEventListener('click', async () => {
-            const textToSend = testDataInput.value;
-            if (!textToSend) return alert("文字を入力してください");
-
-            statusText.innerText = "GASへ送信中...";
+            statusText.innerText = `読み取り成功:「${decodedText}」\nGASへ送信中...`;
             statusText.style.color = "#0071e3";
 
+            // バイブレーションが使える端末ならブルッと震わせる（音の代わり）
+            if (navigator.vibrate) navigator.vibrate(200);
+
+            // GAS（スプレッドシート）へデータをPOST送信
             try {
-                // Fetch APIを使ってGASに非同期でPOSTリクエストを送る
-                const response = await fetch(GAS_URL, {
+                await fetch(GAS_URL, {
                     method: "POST",
-                    mode: "no-cors", // GASのCORS制限を回避するための設定
-                    headers: {
-                        "Content-Type": "application/json"
-                    },
-                    body: JSON.stringify({ text: textToSend })
+                    mode: "no-cors",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ text: decodedText })
                 });
 
-                // ※ mode: "no-cors" の場合、レスポンスの中身はブラウザの制限で読めませんが、
-                // リクエスト自体は正常にGASに届き、スプレッドシートに書き込まれます。
-                statusText.innerText = "送信処理完了！（スプレッドシートを確認してください）";
+                statusText.innerText = `送信完了: ${decodedText}`;
                 statusText.style.color = "#34c759";
 
+                // 画面の履歴一覧に追加
+                const li = document.createElement('li');
+                const timeStr = new Date().toLocaleTimeString();
+                li.innerText = `[${timeStr}] ${decodedText}`;
+                historyList.insertBefore(li, historyList.firstChild);
+
             } catch (err) {
-                statusText.innerText = "送信エラー: " + err.message;
+                statusText.innerText = `GAS送信エラー: ${err.message}`;
                 statusText.style.color = "#ff3b30";
                 console.error(err);
             }
-        });
+        }
+
+        // ③ スキャンの開始・停止を制御する関数
+        async function toggleScanner() {
+            if (isScanning) {
+                // 停止処理
+                if (html5QrcodeScanner) {
+                    await html5QrcodeScanner.stop();
+                }
+                btnToggle.innerText = "スキャン開始";
+                statusText.innerText = "カメラ停止中";
+                statusText.style.color = "#86868b";
+                isScanning = false;
+            } else {
+                // 開始処理
+                isScanning = true;
+                btnToggle.innerText = "停止";
+                statusText.innerText = "カメラを初期化中...";
+                
+                // インスタンスの作成（'reader'はHTMLのdivのID）
+                html5QrcodeScanner = new Html5Qrcode("reader");
+                
+                const config = {
+                    fps: 10, // 1秒間に何回スキャンを試みるか
+                    qrbox: function(width, height) {
+                        // 画面サイズに応じて読み取り枠のサイズを可変にする
+                        const minEdge = Math.min(width, height);
+                        const boxSize = Math.floor(minEdge * 0.7);
+                        return { width: boxSize, height: boxSize };
+                    }
+                };
+
+                try {
+                    // 背面カメラ(environment)を優先して起動
+                    await html5QrcodeScanner.start(
+                        { facingMode: "environment" }, 
+                        config, 
+                        onScanSuccess
+                    );
+                    statusText.innerText = "スキャン中... QRまたはバーコードを枠に合わせてください";
+                    statusText.style.color = "#34c759";
+                } catch (err) {
+                    statusText.innerText = "スキャン開始エラー: " + err;
+                    statusText.style.color = "#ff3b30";
+                    btnToggle.innerText = "スキャン開始";
+                    isScanning = false;
+                    console.error(err);
+                }
+            }
+        }
+
+        btnToggle.addEventListener('click', toggleScanner);
     </script>
 </body>
 </html>
